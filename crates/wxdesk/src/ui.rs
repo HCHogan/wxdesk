@@ -598,14 +598,13 @@ impl Ui {
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |d| d.as_secs() as i64),
         };
-        info!(
+        info!(seq = message.seq, mine, ?kind, "message");
+        debug!(
             seq = message.seq,
             chat,
             sender = message.sender,
-            mine,
-            ?kind,
             text = message.text,
-            "message"
+            "what it says"
         );
         if !mine && kind == Kind::Image {
             match self.copy_image(row, group).await {
