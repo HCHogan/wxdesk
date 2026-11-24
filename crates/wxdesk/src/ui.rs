@@ -18,7 +18,7 @@ use atspi_common::Role;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use futures_util::StreamExt;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -355,6 +355,10 @@ impl Ui {
             .await
             .ok_or_else(|| anyhow!("no session list: not logged in"))?;
         info!("found the main window");
+        // As large as the display, to show as many rows as it can.
+        if let Err(e) = input::fill_screen("^微信$").await {
+            warn!("resizing the main window: {e:#}");
+        }
         self.frame = Some(frame);
         self.sessions = Some(sessions);
         Ok(())
@@ -502,11 +506,22 @@ impl Ui {
         let fresh = match self.tails.get_mut(title) {
             Some(tail) => {
                 let m = overlap(tail, &texts);
+                let mut fresh = texts.len() - m;
+                if m == 0 && !tail.is_empty() {
+                    // Nothing in common: the window moved, or more came
+                    // than it shows. What was read lately isn't news.
+                    warn!(title, "no rows in common with the last look");
+                    let recent: HashSet<String> =
+                        tail.iter().rev().take(50).map(|t| key(t)).collect();
+                    fresh -= texts
+                        .iter()
+                        .take_while(|t| recent.contains(&key(t)))
+                        .count();
+                }
                 // Rows change as they go: a file's state, a voice played.
                 let start = tail.len() - m;
                 tail.truncate(start);
                 tail.extend(texts.iter().cloned());
-                let fresh = texts.len() - m;
                 let drop = tail.len().saturating_sub(300);
                 tail.drain(..drop);
                 fresh
@@ -605,11 +620,12 @@ impl Ui {
             }
         }
         if !mine && kind == Kind::File {
-            let name = message.text.lines().nth(1).unwrap_or_default().to_owned();
+            let name = file_name(&message.text).unwrap_or_default().to_owned();
+            let came = SystemTime::now();
             let home = self.cfg.home.clone();
             let out = self.out.clone();
             tokio::spawn(async move {
-                match fetch_file(&home, &name).await {
+                match fetch_file(&home, &name, came).await {
                     Ok(data) => {
                         message.attachment = Some(Attachment {
                             name,
@@ -638,12 +654,12 @@ impl Ui {
     }
 
     /// Right-clicks the image in `row`, 复制, and reads the clipboard. A
-    /// row just come in may still be moving, so it's looked for again, and
-    /// tried a few times.
+    /// row just come in may still be moving, so it's looked for again; an
+    /// image still downloading has no menu, so it's tried for half a minute.
     async fn copy_image(&mut self, row: &Row, group: bool) -> Result<Vec<u8>> {
         let mut last = anyhow!("not tried");
-        for _ in 0..3 {
-            input::pause(1000).await;
+        for wait in [1000, 2000, 3000, 4000, 5000, 5000, 5000, 5000] {
+            input::pause(wait).await;
             let list = self.message_list().await?;
             let Some(now) = rows(&self.a, &list)
                 .await?
@@ -845,18 +861,21 @@ fn overlap(tail: &[String], rows: &[String]) -> usize {
         .unwrap_or(0)
 }
 
-/// What stays of a row's text as its state changes: a file's name and
-/// size without whether it's downloaded, a voice without whether it's
-/// been played.
-fn key(text: &str) -> &str {
-    if text.starts_with("文件\n") {
-        let end = text
-            .match_indices('\n')
-            .nth(2)
-            .map_or(text.len(), |(i, _)| i);
-        return &text[..end];
+/// What stays of a row's text as its state changes: a file's name without
+/// its size, progress or whether it's downloaded; a voice without whether
+/// it's been played.
+fn key(text: &str) -> String {
+    if let Some(name) = file_name(text) {
+        return format!("文件\n{name}");
     }
-    text.strip_suffix("未播放").unwrap_or(text)
+    text.strip_suffix("未播放").unwrap_or(text).to_owned()
+}
+
+/// The name in a file's row: `文件\nname\nsize\nstate`, or, while it
+/// downloads, `文件\n进度: 3%\nname`.
+fn file_name(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix("文件\n")?;
+    rest.lines().find(|l| !l.starts_with("进度"))
 }
 
 /// A time between messages, such as `18:52` or `昨天 18:52`.
@@ -888,51 +907,80 @@ fn parse(text: &str, height: i32, group: bool, drawn: bool) -> (Kind, String, Op
         );
     }
     if kind == Kind::File {
-        return (kind, key(text).to_owned(), None);
+        return (kind, key(text), None);
     }
     (kind, text.to_owned(), None)
 }
 
-/// A received file, once WeChat has downloaded it.
-async fn fetch_file(home: &std::path::Path, name: &str) -> Result<Vec<u8>> {
+/// A received file, once WeChat has downloaded it: WeChat makes a file
+/// read-only when it has all of it. A file of a name taken is saved as
+/// `name(1).ext`; one modified since the message came is taken first, and
+/// after a few seconds without one, the newest, which WeChat may have
+/// linked to a file it had of the same content.
+async fn fetch_file(home: &std::path::Path, name: &str, came: SystemTime) -> Result<Vec<u8>> {
     const LIMIT: u64 = 25 << 20;
-    let mut last = None;
-    for _ in 0..60 {
-        if let Some(path) = find_download(home, name) {
-            let size = std::fs::metadata(&path)?.len();
-            if size > LIMIT {
-                bail!("{size} bytes, more than {LIMIT}");
+    let since = came - Duration::from_secs(60);
+    for i in 0..600 {
+        let files = downloads(home, name);
+        let newest = |since: SystemTime| {
+            files
+                .iter()
+                .filter(|(m, _, _)| *m >= since)
+                .max_by_key(|(m, _, _)| *m)
+        };
+        let pick = newest(since).or_else(|| (i >= 5).then(|| newest(UNIX_EPOCH)).flatten());
+        if let Some((_, path, meta)) = pick {
+            if meta.len() > LIMIT {
+                bail!("{} bytes, more than {LIMIT}", meta.len());
             }
-            if last == Some(size) && size > 0 {
-                return Ok(tokio::fs::read(&path).await?);
+            if meta.permissions().readonly() && meta.len() > 0 {
+                return Ok(tokio::fs::read(path).await?);
             }
-            last = Some(size);
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    bail!("not downloaded within a minute")
+    bail!("not downloaded within ten minutes")
 }
 
-/// `~/xwechat_files/<account>/msg/file/<month>/<name>`, the newest.
-fn find_download(home: &std::path::Path, name: &str) -> Option<PathBuf> {
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    for account in std::fs::read_dir(home.join("xwechat_files"))
-        .ok()?
-        .flatten()
-    {
+/// `~/xwechat_files/<account>/msg/file/<month>/<name>`, and `name(N)`.
+fn downloads(home: &std::path::Path, name: &str) -> Vec<(SystemTime, PathBuf, std::fs::Metadata)> {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem, format!(".{ext}")),
+        None => (name, String::new()),
+    };
+    let ours = |f: &str| {
+        f == name
+            || f.strip_prefix(stem)
+                .and_then(|r| r.strip_suffix(ext.as_str()))
+                .and_then(|r| r.strip_prefix('('))
+                .and_then(|r| r.strip_suffix(')'))
+                .is_some_and(|n| n.parse::<u32>().is_ok())
+    };
+    let mut out = Vec::new();
+    let Ok(accounts) = std::fs::read_dir(home.join("xwechat_files")) else {
+        return out;
+    };
+    for account in accounts.flatten() {
         let Ok(months) = std::fs::read_dir(account.path().join("msg/file")) else {
             continue;
         };
         for month in months.flatten() {
-            let p = month.path().join(name);
-            if let Ok(m) = std::fs::metadata(&p).and_then(|m| m.modified())
-                && best.as_ref().is_none_or(|(t, _)| m > *t)
-            {
-                best = Some((m, p));
+            let Ok(files) = std::fs::read_dir(month.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                if !f.file_name().to_str().is_some_and(ours) {
+                    continue;
+                }
+                if let Ok(meta) = f.metadata()
+                    && let Ok(m) = meta.modified()
+                {
+                    out.push((m, f.path(), meta));
+                }
             }
         }
     }
-    best.map(|(_, p)| p)
+    out
 }
 
 #[cfg(test)]
@@ -956,6 +1004,14 @@ mod tests {
         let tail = s(&["a", "b", "文件\nx.pdf\n1K\n对方上传中"]);
         let rows = s(&["a", "b", "文件\nx.pdf\n1K\n未下载\n微信电脑版"]);
         assert_eq!(overlap(&tail, &rows), 3);
+    }
+
+    #[test]
+    fn a_file_row_downloading_is_the_same_row() {
+        let tail = s(&["a", "文件\n进度: 0%\nx.pdf"]);
+        let rows = s(&["a", "文件\n进度: 3%\nx.pdf"]);
+        assert_eq!(overlap(&tail, &rows), 2);
+        assert_eq!(key("文件\nx.pdf\n3.2M"), key(&rows[1]));
     }
 
     #[test]

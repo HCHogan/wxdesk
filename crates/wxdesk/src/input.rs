@@ -34,6 +34,26 @@ pub async fn park() -> Result<()> {
     xdotool(&["mousemove", "0", "0"]).await
 }
 
+/// Moves the windows called `name` (a regex) to the top left and makes
+/// them as large as the display.
+pub async fn fill_screen(name: &str) -> Result<()> {
+    xdotool(&[
+        "search",
+        "--onlyvisible",
+        "--name",
+        name,
+        "windowmove",
+        "%@",
+        "0",
+        "0",
+        "windowsize",
+        "%@",
+        "100%",
+        "100%",
+    ])
+    .await
+}
+
 pub async fn key(k: &str) -> Result<()> {
     xdotool(&["key", k]).await
 }
