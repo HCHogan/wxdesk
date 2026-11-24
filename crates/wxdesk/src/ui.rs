@@ -42,7 +42,11 @@ pub struct Status {
 /// A row of the open chat, drawn by WeChat with its sender's avatar.
 #[derive(Clone, Debug)]
 pub struct Drawn {
+    /// The chat open when it was drawn.
+    chat: Option<String>,
     text: String,
+    /// Where the row's top was.
+    y: i32,
     sender: String,
     mine: bool,
     at: Instant,
@@ -53,6 +57,8 @@ pub struct Drawn {
 pub struct Shared {
     /// The message list now, which [`watch`] looks under.
     pub list: Option<Obj>,
+    /// The chat open now.
+    pub open: Option<String>,
     pub drawn: VecDeque<Drawn>,
 }
 
@@ -136,8 +142,11 @@ pub async fn watch(a: A11y, app: Obj, shared: Arc<Mutex<Shared>>, poke: Sender<(
         let mine = rect.x > row.rect.x + row.rect.w / 2;
         debug!(sender, mine, text = row.text, "drawn");
         let mut sh = shared.lock().unwrap();
+        let chat = sh.open.clone();
         sh.drawn.push_back(Drawn {
+            chat,
             text: row.text.clone(),
+            y: row.rect.y,
             sender,
             mine,
             at: now,
@@ -166,19 +175,23 @@ async fn rows(a: &A11y, list: &Obj) -> Result<Vec<Row>> {
     Ok(rows)
 }
 
-/// The drawn rows that drew `fresh`, newest last on both sides: each row
-/// takes the newest drawing of its text not taken by a later row. Older
+/// The drawn rows that drew `fresh` in `chat`, newest last on both sides:
+/// each row takes the newest drawing of its text where it is now, or else
+/// the newest drawing of its text, not taken by a later row. Older
 /// drawings of a text taken are of rows read before, drawn again, and go.
-fn take_drawn(drawn: &mut VecDeque<Drawn>, fresh: &[&Row]) -> Vec<Option<Drawn>> {
+fn take_drawn(drawn: &mut VecDeque<Drawn>, chat: &str, fresh: &[&Row]) -> Vec<Option<Drawn>> {
     let horizon = Instant::now().checked_sub(DRAWN_FOR);
     drawn.retain(|d| horizon.is_none_or(|h| d.at >= h));
     let mut taken = vec![false; drawn.len()];
     let mut out = vec![None; fresh.len()];
     for (i, row) in fresh.iter().enumerate().rev() {
-        if let Some(j) = (0..drawn.len())
+        let candidate = |j: usize| {
+            !taken[j] && drawn[j].chat.as_deref() == Some(chat) && drawn[j].text == row.text
+        };
+        let there = (0..drawn.len())
             .rev()
-            .find(|&j| !taken[j] && drawn[j].text == row.text)
-        {
+            .find(|&j| candidate(j) && (drawn[j].y - row.rect.y).abs() <= 3);
+        if let Some(j) = there.or_else(|| (0..drawn.len()).rev().find(|&j| candidate(j))) {
             taken[j] = true;
             out[i] = Some(drawn[j].clone());
         }
@@ -191,7 +204,8 @@ fn take_drawn(drawn: &mut VecDeque<Drawn>, fresh: &[&Row]) -> Vec<Option<Drawn>>
     }
     let mut j = 0;
     drawn.retain(|d| {
-        let keep = newest_taken.get(&d.text).is_none_or(|&n| j > n);
+        let keep =
+            d.chat.as_deref() != Some(chat) || newest_taken.get(&d.text).is_none_or(|&n| j > n);
         j += 1;
         keep
     });
@@ -292,6 +306,7 @@ impl Ui {
         }
         let group = self.cfg.group.clone();
         let first = self.seen.is_empty();
+        let mut read = false;
         for s in self.session_items().await? {
             let before = self.seen.insert(s.title.clone(), s.name.clone());
             if first || s.title == group {
@@ -300,6 +315,13 @@ impl Ui {
             let changed = before.as_ref().is_some_and(|b| *b != s.name);
             if s.unread > 0 || changed || before.is_none() {
                 self.read_private(&s.title, s.unread.max(1)).await?;
+                read = true;
+            }
+        }
+        if read {
+            // Reading a chat changes its item; that isn't news.
+            for s in self.session_items().await? {
+                self.seen.insert(s.title, s.name);
             }
         }
         self.open_chat(&group).await?;
@@ -442,7 +464,11 @@ impl Ui {
         input::click(x, y).await?;
         input::pause(700).await;
         self.open = Some(title.to_owned());
-        self.shared.lock().unwrap().list = None;
+        {
+            let mut sh = self.shared.lock().unwrap();
+            sh.list = None;
+            sh.open = Some(title.to_owned());
+        }
         self.message_list().await?;
         debug!(title, "opened");
         Ok(())
@@ -475,8 +501,12 @@ impl Ui {
         let texts: Vec<String> = rows.iter().map(|r| r.text.clone()).collect();
         let fresh = match self.tails.get_mut(title) {
             Some(tail) => {
-                let fresh = texts.len() - overlap(tail, &texts);
-                tail.extend(texts[texts.len() - fresh..].iter().cloned());
+                let m = overlap(tail, &texts);
+                // Rows change as they go: a file's state, a voice played.
+                let start = tail.len() - m;
+                tail.truncate(start);
+                tail.extend(texts.iter().cloned());
+                let fresh = texts.len() - m;
                 let drop = tail.len().saturating_sub(300);
                 tail.drain(..drop);
                 fresh
@@ -502,7 +532,7 @@ impl Ui {
         if fresh.is_empty() {
             return Ok(());
         }
-        let drawn = take_drawn(&mut self.shared.lock().unwrap().drawn, &fresh);
+        let drawn = take_drawn(&mut self.shared.lock().unwrap().drawn, title, &fresh);
         for (row, drawn) in fresh.into_iter().zip(drawn) {
             self.emit(title, group, row, drawn).await;
         }
@@ -607,21 +637,48 @@ impl Ui {
             .then(|| sender.to_owned())
     }
 
-    /// Right-clicks the image in `row`, 复制, and reads the clipboard.
+    /// Right-clicks the image in `row`, 复制, and reads the clipboard. A
+    /// row just come in may still be moving, so it's looked for again, and
+    /// tried a few times.
     async fn copy_image(&mut self, row: &Row, group: bool) -> Result<Vec<u8>> {
-        let top = row.rect.y + if group { 26 } else { AVATAR_OFFSET };
-        let bottom = row.rect.y + row.rect.h - 8;
-        input::right_click(row.rect.x + 110, (top + bottom) / 2).await?;
-        input::pause(500).await;
-        let Some(copy) = self.menu_item("复制").await else {
-            input::key("Escape").await?;
-            bail!("no 复制 in the menu");
-        };
-        let (x, y) = copy.center();
-        input::click(x, y).await?;
-        input::pause(400).await;
-        input::park().await?;
-        input::clipboard("image/png").await
+        let mut last = anyhow!("not tried");
+        for _ in 0..3 {
+            input::pause(1000).await;
+            let list = self.message_list().await?;
+            let Some(now) = rows(&self.a, &list)
+                .await?
+                .into_iter()
+                .filter(|r| r.text == row.text)
+                .min_by_key(|r| (r.rect.y - row.rect.y).abs())
+            else {
+                bail!("the image's row is gone");
+            };
+            let top = now.rect.y + if group { 26 } else { AVATAR_OFFSET };
+            let bottom = now.rect.y + now.rect.h - 8;
+            input::right_click(now.rect.x + 110, (top + bottom) / 2).await?;
+            let mut copy = None;
+            for _ in 0..10 {
+                input::pause(150).await;
+                copy = self.menu_item("复制").await;
+                if copy.is_some() {
+                    break;
+                }
+            }
+            let Some(copy) = copy else {
+                input::key("Escape").await?;
+                last = anyhow!("no 复制 in the menu");
+                continue;
+            };
+            let (x, y) = copy.center();
+            input::click(x, y).await?;
+            input::pause(400).await;
+            input::park().await?;
+            match input::clipboard("image/png").await {
+                Ok(png) => return Ok(png),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     /// A showing menu item called `name`, in a popup menu.
@@ -772,12 +829,34 @@ impl Ui {
 }
 
 /// How many of `rows` the end of `tail` already has: the longest prefix
-/// of `rows` that `tail` ends with.
+/// of `rows` that `tail` ends with, row by row as [`key`] has them. A row
+/// in four may differ, as one does that is recalled.
 fn overlap(tail: &[String], rows: &[String]) -> usize {
-    (0..=rows.len().min(tail.len()))
+    (1..=rows.len().min(tail.len()))
         .rev()
-        .find(|&m| rows[..m] == tail[tail.len() - m..])
+        .find(|&m| {
+            let misses = rows[..m]
+                .iter()
+                .zip(&tail[tail.len() - m..])
+                .filter(|(a, b)| key(a) != key(b))
+                .count();
+            misses == 0 || (m >= 4 && misses * 4 <= m)
+        })
         .unwrap_or(0)
+}
+
+/// What stays of a row's text as its state changes: a file's name and
+/// size without whether it's downloaded, a voice without whether it's
+/// been played.
+fn key(text: &str) -> &str {
+    if text.starts_with("文件\n") {
+        let end = text
+            .match_indices('\n')
+            .nth(2)
+            .map_or(text.len(), |(i, _)| i);
+        return &text[..end];
+    }
+    text.strip_suffix("未播放").unwrap_or(text)
 }
 
 /// A time between messages, such as `18:52` or `昨天 18:52`.
@@ -807,6 +886,9 @@ fn parse(text: &str, height: i32, group: bool, drawn: bool) -> (Kind, String, Op
                 text: said.to_owned(),
             }),
         );
+    }
+    if kind == Kind::File {
+        return (kind, key(text).to_owned(), None);
     }
     (kind, text.to_owned(), None)
 }
@@ -869,6 +951,20 @@ mod tests {
         assert_eq!(overlap(&s(&["a"]), &s(&["x", "y"])), 0);
     }
 
+    #[test]
+    fn a_file_row_changing_state_is_the_same_row() {
+        let tail = s(&["a", "b", "文件\nx.pdf\n1K\n对方上传中"]);
+        let rows = s(&["a", "b", "文件\nx.pdf\n1K\n未下载\n微信电脑版"]);
+        assert_eq!(overlap(&tail, &rows), 3);
+    }
+
+    #[test]
+    fn a_recalled_row_in_four_is_still_read_before() {
+        let tail = s(&["a", "b", "c", "d"]);
+        let rows = s(&["a", "某人撤回了一条消息", "c", "d", "e"]);
+        assert_eq!(overlap(&tail, &rows), 4);
+    }
+
     fn row(text: &str) -> Row {
         Row {
             text: text.into(),
@@ -878,7 +974,9 @@ mod tests {
 
     fn drawn(text: &str, sender: &str) -> Drawn {
         Drawn {
+            chat: Some("g".into()),
             text: text.into(),
+            y: -100,
             sender: sender.into(),
             mine: false,
             at: Instant::now(),
@@ -890,17 +988,29 @@ mod tests {
         // "ok" by A, read before and drawn again; then "ok" by B, new.
         let mut d = VecDeque::from([drawn("ok", "A"), drawn("hi", "C"), drawn("ok", "B")]);
         let r = row("ok");
-        let got = take_drawn(&mut d, &[&r]);
+        let got = take_drawn(&mut d, "g", &[&r]);
         assert_eq!(got[0].as_ref().unwrap().sender, "B");
         assert_eq!(d.len(), 1);
         assert_eq!(d[0].text, "hi");
     }
 
     #[test]
+    fn a_row_takes_the_drawing_where_it_is() {
+        // Two rows "hi", the new one at the bottom, drawn in another order.
+        let mut d = VecDeque::from([drawn("hi", "A"), drawn("hi", "B")]);
+        d[0].y = 500;
+        d[1].y = 300;
+        let mut r = row("hi");
+        r.rect.y = 500;
+        let got = take_drawn(&mut d, "g", &[&r]);
+        assert_eq!(got[0].as_ref().unwrap().sender, "A");
+    }
+
+    #[test]
     fn a_burst_of_the_same_text_keeps_its_order() {
         let mut d = VecDeque::from([drawn("1", "A"), drawn("1", "B")]);
         let (r1, r2) = (row("1"), row("1"));
-        let got = take_drawn(&mut d, &[&r1, &r2]);
+        let got = take_drawn(&mut d, "g", &[&r1, &r2]);
         assert_eq!(got[0].as_ref().unwrap().sender, "A");
         assert_eq!(got[1].as_ref().unwrap().sender, "B");
         assert!(d.is_empty());
