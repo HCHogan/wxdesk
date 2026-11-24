@@ -21,13 +21,13 @@
         default = self.packages.${system}.wxdesk;
       };
 
+      # WeChat and wxdesk, on a NixOS machine.
       nixosModules.default = ./nix/module.nix;
+      # The VM they run in, on the host that runs it.
+      nixosModules.vm = ./nix/vm.nix;
 
-      nixosConfigurations.wxprobe = nixpkgs.lib.nixosSystem {
+      nixosConfigurations.wxdesk-vm = nixpkgs.lib.nixosSystem {
         inherit system;
-        specialArgs = {
-          inherit (self.packages.${system}) wxdesk wechat;
-        };
         modules = [ ./vm/guest.nix ];
       };
     };

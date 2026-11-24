@@ -3,7 +3,7 @@
 # The display is Xvnc :1 (1280x800) with openbox, in a D-Bus session of its
 # own with the accessibility bus. Log WeChat in through VNC once (the
 # password is in /var/lib/wxvnc/password); the login lasts in /home/wx.
-# wxdesk then serves on `port` and wants the token in /var/lib/wxdesk/token.
+# wxdesk then serves on `port` and wants the token in `tokenFile`.
 {
   config,
   lib,
@@ -61,6 +61,14 @@ in
       type = lib.types.port;
       default = 7710;
     };
+    tokenFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        The token clients send first, readable by wx; null makes one in
+        /var/lib/wxdesk/token.
+      '';
+    };
     environmentFile = lib.mkOption {
       type = lib.types.path;
       default = "/var/lib/wxdesk/env";
@@ -109,6 +117,8 @@ in
           chown wx /var/lib/wxvnc/passwd
         fi
         install -d -m 0750 -o wx -g users /var/lib/wxdesk
+      ''
+      + lib.optionalString (cfg.tokenFile == null) ''
         if [ ! -e /var/lib/wxdesk/token ]; then
           umask 077
           tr -dc A-Za-z0-9 < /dev/urandom | head -c 32 > /var/lib/wxdesk/token
@@ -151,7 +161,7 @@ in
       ];
       environment = {
         WXDESK_LISTEN = "0.0.0.0:${toString cfg.port}";
-        WXDESK_TOKEN_FILE = "/var/lib/wxdesk/token";
+        WXDESK_TOKEN_FILE = if cfg.tokenFile == null then "/var/lib/wxdesk/token" else cfg.tokenFile;
       };
       script = ''
         while [ ! -s ${envFile} ]; do sleep 1; done
