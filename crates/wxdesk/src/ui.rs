@@ -328,10 +328,11 @@ impl Ui {
         self.poll_group().await
     }
 
-    /// Finds the main window and its session list.
+    /// Finds the main window and its session list. The window is the frame
+    /// the list is in: its name is the client's brand, 微信 or WeChat.
     async fn locate(&mut self) -> Result<()> {
         if let (Some(f), Some(s)) = (&self.frame, &self.sessions)
-            && self.a.name(f).await.is_ok_and(|n| n == "微信")
+            && self.a.role(f).await.is_ok_and(|r| r == Role::Frame)
             && self.a.name(s).await.is_ok_and(|n| n == "会话")
         {
             return Ok(());
@@ -341,22 +342,22 @@ impl Ui {
         self.input = None;
         self.open = None;
         self.shared.lock().unwrap().list = None;
-        let mut frame = None;
+        let mut found = None;
         for o in self.a.children(&self.app).await? {
             if self.a.role(&o).await.is_ok_and(|r| r == Role::Frame)
-                && self.a.name(&o).await.is_ok_and(|n| n == "微信")
+                && let Some(s) = self.find_showing(&o, Role::List, "会话").await
             {
-                frame = Some(o);
+                found = Some((o, s));
+                break;
             }
         }
-        let frame = frame.ok_or_else(|| anyhow!("no main window: not logged in"))?;
-        let sessions = self
-            .find_showing(&frame, Role::List, "会话")
-            .await
-            .ok_or_else(|| anyhow!("no session list: not logged in"))?;
-        info!("found the main window");
+        let (frame, sessions) = found.ok_or_else(|| anyhow!("no session list: not logged in"))?;
+        let name = self.a.name(&frame).await.unwrap_or_default();
+        info!(name, "found the main window");
         // As large as the display, to show as many rows as it can.
-        if let Err(e) = input::fill_screen("^微信$").await {
+        if !name.is_empty()
+            && let Err(e) = input::fill_screen(&format!("^{name}$")).await
+        {
             warn!("resizing the main window: {e:#}");
         }
         self.frame = Some(frame);
