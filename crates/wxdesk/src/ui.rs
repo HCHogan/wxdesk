@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn quotes_split_off() {
         let (kind, text, quote) = parse(
-            "ok\n引用 Hank 的消息 : [聊天记录]Group Chat History",
+            "ok\n引用 Alice 的消息 : [聊天记录]Group Chat History",
             94,
             true,
             true,
@@ -1082,7 +1082,7 @@ mod tests {
         assert_eq!(kind, Kind::Text);
         assert_eq!(text, "ok");
         let q = quote.unwrap();
-        assert_eq!(q.sender, "Hank");
+        assert_eq!(q.sender, "Alice");
         assert_eq!(q.text, "[聊天记录]Group Chat History");
     }
 }
