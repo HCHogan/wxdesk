@@ -13,9 +13,10 @@ mod input;
 mod ui;
 
 use anyhow::{Context, Result};
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
@@ -62,10 +63,25 @@ async fn main() -> Result<()> {
     let (poke, pokes) = mpsc::channel(1);
     let (events, _) = broadcast::channel(1024);
 
-    let fan = events.clone();
+    // Messages wait here while no client is connected, as when the
+    // client restarts.
+    let backlog = Arc::new(Mutex::new(VecDeque::new()));
+    let run = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+
+    let (fan, kept) = (events.clone(), backlog.clone());
     tokio::spawn(async move {
         while let Some(e) = out_rx.recv().await {
-            let _ = fan.send(e);
+            let mut kept = kept.lock().unwrap();
+            if fan.receiver_count() > 0 {
+                let _ = fan.send(e);
+            } else if matches!(e, FromDriver::Message(_)) {
+                kept.push_back(e);
+                while kept.len() > BACKLOG {
+                    kept.pop_front();
+                }
+            }
         }
     });
     let watcher = tokio::spawn(ui::watch(a.clone(), app.clone(), shared.clone(), poke));
@@ -86,10 +102,12 @@ async fn main() -> Result<()> {
             let (stream, peer) = listener.accept().await?;
             info!(%peer, "a client");
             let conn = Conn {
+                run,
                 token: token.clone(),
                 group: group.clone(),
                 status: status.clone(),
-                events: events.subscribe(),
+                events: events.clone(),
+                backlog: backlog.clone(),
                 commands: commands.clone(),
             };
             tokio::spawn(async move {
@@ -114,16 +132,21 @@ async fn connect() -> Result<(a11y::A11y, a11y::Obj)> {
     Ok((a, app))
 }
 
+/// Messages kept while no client is connected, at most.
+const BACKLOG: usize = 500;
+
 struct Conn {
+    run: u64,
     token: Option<String>,
     group: String,
     status: Arc<Mutex<ui::Status>>,
-    events: broadcast::Receiver<FromDriver>,
+    events: broadcast::Sender<FromDriver>,
+    backlog: Arc<Mutex<VecDeque<FromDriver>>>,
     commands: mpsc::UnboundedSender<ToDriver>,
 }
 
 impl Conn {
-    async fn serve(mut self, stream: TcpStream) -> Result<()> {
+    async fn serve(self, stream: TcpStream) -> Result<()> {
         stream.set_nodelay(true)?;
         let (read, mut write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
@@ -140,12 +163,22 @@ impl Conn {
         let hello = {
             let st = self.status.lock().unwrap();
             FromDriver::Hello {
+                run: self.run,
                 me: st.me.clone(),
                 group: self.group.clone(),
                 logged_in: st.logged_in,
             }
         };
+        // Subscribed with the backlog held, so what comes after it comes
+        // to this client.
+        let (mut events, kept) = {
+            let mut backlog = self.backlog.lock().unwrap();
+            (self.events.subscribe(), std::mem::take(&mut *backlog))
+        };
         send(&mut write, &hello).await?;
+        for e in &kept {
+            send(&mut write, e).await?;
+        }
         loop {
             tokio::select! {
                 line = lines.next_line() => {
@@ -160,7 +193,7 @@ impl Conn {
                         Err(e) => warn!("a line that isn't a command: {e}"),
                     }
                 }
-                e = self.events.recv() => match e {
+                e = events.recv() => match e {
                     Ok(e) => send(&mut write, &e).await?,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(n, "a client fell behind; events dropped");

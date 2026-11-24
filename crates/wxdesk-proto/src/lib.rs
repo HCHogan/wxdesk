@@ -1,6 +1,6 @@
 //! What wxdesk's driver and its client say to each other: one JSON value
 //! a line over a TCP stream. The client sends [`ToDriver`] and reads
-//! [`FromDriver`].
+//! [`FromDriver`]; [`connect`] is the client's end.
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -11,8 +11,12 @@ use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum FromDriver {
-    /// First, on every connection.
+    /// First, on every connection; then the messages that came while no
+    /// client was connected, at most 500.
     Hello {
+        /// When the driver started, in Unix milliseconds: a message is
+        /// known by this and its `seq`.
+        run: u64,
         /// The bot's display name, once the driver has seen it.
         me: Option<String>,
         /// The group the driver keeps open.
@@ -30,7 +34,7 @@ pub enum FromDriver {
 /// A message as the client showed it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Message {
-    /// Increasing within one run of the driver.
+    /// Increasing within one run of the driver (see `Hello`).
     pub seq: u64,
     /// The chat's title: the group's name, or the friend's remark or name.
     pub chat: String,
@@ -103,44 +107,36 @@ pub enum ToDriver {
     },
 }
 
-/// One connection to the driver.
-pub struct Client {
-    lines: tokio::io::Lines<BufReader<OwnedReadHalf>>,
-    write: OwnedWriteHalf,
+/// Connects to the driver at `addr` and, with a token, authenticates: what
+/// it says, and where to send commands.
+///
+/// # Errors
+///
+/// If the connection fails.
+pub async fn connect(addr: &str, token: Option<&str>) -> std::io::Result<(Events, Commands)> {
+    let stream = TcpStream::connect(addr).await?;
+    stream.set_nodelay(true)?;
+    let (read, write) = stream.into_split();
+    let mut commands = Commands { write };
+    if let Some(token) = token {
+        commands
+            .send(&ToDriver::Auth {
+                token: token.to_owned(),
+            })
+            .await?;
+    }
+    let events = Events {
+        lines: BufReader::new(read).lines(),
+    };
+    Ok((events, commands))
 }
 
-impl Client {
-    /// Connects and, with a token, authenticates.
-    ///
-    /// # Errors
-    ///
-    /// If the connection fails.
-    pub async fn connect(addr: &str, token: Option<&str>) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
-        let (read, write) = stream.into_split();
-        let mut client = Self {
-            lines: BufReader::new(read).lines(),
-            write,
-        };
-        if let Some(token) = token {
-            client
-                .send(&ToDriver::Auth {
-                    token: token.to_owned(),
-                })
-                .await?;
-        }
-        Ok(client)
-    }
+/// What the driver says on a connection.
+pub struct Events {
+    lines: tokio::io::Lines<BufReader<OwnedReadHalf>>,
+}
 
-    /// # Errors
-    ///
-    /// If writing fails.
-    pub async fn send(&mut self, command: &ToDriver) -> std::io::Result<()> {
-        let mut line = serde_json::to_vec(command)?;
-        line.push(b'\n');
-        self.write.write_all(&line).await
-    }
-
+impl Events {
     /// The next thing the driver says; none when it hangs up.
     ///
     /// # Errors
@@ -151,5 +147,21 @@ impl Client {
             None => Ok(None),
             Some(line) => Ok(Some(serde_json::from_str(&line)?)),
         }
+    }
+}
+
+/// Where commands go on a connection.
+pub struct Commands {
+    write: OwnedWriteHalf,
+}
+
+impl Commands {
+    /// # Errors
+    ///
+    /// If writing fails.
+    pub async fn send(&mut self, command: &ToDriver) -> std::io::Result<()> {
+        let mut line = serde_json::to_vec(command)?;
+        line.push(b'\n');
+        self.write.write_all(&line).await
     }
 }
